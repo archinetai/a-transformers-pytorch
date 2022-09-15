@@ -3,7 +3,7 @@ from typing import Callable, Optional, TypeVar, Union
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 from einops_exts import rearrange_many
 from torch import Tensor, einsum, nn
 from typing_extensions import TypeGuard
@@ -23,6 +23,25 @@ def default(val: Optional[T], d: Union[Callable[..., T], T]) -> T:
     if exists(val):
         return val
     return d() if isfunction(d) else d
+
+
+def log(val: Tensor, eps: float = 1e-20) -> Tensor:
+    return torch.log(val.clamp(min=eps))
+
+
+def gumbel_sample(val: Tensor, temperature: float, dim: int = -1) -> Tensor:
+    noise = torch.zeros_like(val).uniform_(0, 1)
+    gumbel_noise = -log(-log(noise))
+    return ((val / temperature) + gumbel_noise).argmax(dim=dim)
+
+
+def top_k(logits: Tensor, threshold: float) -> Tensor:
+    num_logits = logits.shape[-1]
+    k = max(int((1 - threshold) * num_logits), 1)
+    values, indices = torch.topk(logits, k)
+    probs = torch.full_like(logits, float("-inf"))
+    probs.scatter_(1, indices, values)
+    return probs
 
 
 """
@@ -79,7 +98,7 @@ class AttentionBase(nn.Module):
         self.num_heads = num_heads
         self.causal = causal
         mid_features = head_features * num_heads
-        out_features = out_features if exists(out_features) else features
+        out_features = default(out_features, features)
 
         self.to_out = nn.Sequential(
             nn.Linear(in_features=mid_features, out_features=out_features, bias=False),
@@ -94,14 +113,12 @@ class AttentionBase(nn.Module):
         *,
         causal: bool = False,
         mask: Optional[Tensor] = None,
-        rel_pos: Optional[nn.Module] = None,
     ) -> Tensor:
         # Split heads
         q, k, v = rearrange_many((q, k, v), "b n (h d) -> b h n d", h=self.num_heads)
 
         # Compute similarity matrix, add bias and mask
         sim = einsum("... n d, ... m d -> ... n m", q, k) * self.scale
-        sim = rel_pos(sim) if exists(rel_pos) else sim
         sim = attention_mask(sim, mask) if exists(mask) else sim
         sim = causal_mask(sim) if (causal or self.causal) else sim
 
@@ -122,47 +139,15 @@ class Attention(nn.Module):
         head_features: int,
         num_heads: int,
         out_features: Optional[int] = None,
-        **kwargs,
-    ):
-        super().__init__()
-        mid_features = head_features * num_heads
-
-        self.norm = LayerNorm(features, bias=False)
-        self.to_qkv = nn.Linear(
-            in_features=features, out_features=mid_features * 3, bias=False
-        )
-        self.attention = AttentionBase(
-            features,
-            num_heads=num_heads,
-            head_features=head_features,
-            out_features=out_features,
-            **kwargs,
-        )
-
-    def forward(self, x: Tensor, **kwargs) -> Tensor:
-        x = self.norm(x)
-        q, k, v = torch.chunk(self.to_qkv(x), chunks=3, dim=-1)
-        x = self.attention(q, k, v, **kwargs)
-        return x
-
-
-class CrossAttention(nn.Module):
-    def __init__(
-        self,
-        features: int,
-        *,
-        head_features: int,
-        num_heads: int,
-        context_features: int = None,
+        context_features: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
         mid_features = head_features * num_heads
         context_features = default(context_features, features)
 
-        self.norm_in = LayerNorm(features=features, bias=False)
-        self.norm_context = LayerNorm(features=context_features, bias=False)
-
+        self.norm = LayerNorm(features, bias=False)
+        self.norm_context = LayerNorm(context_features, bias=False)
         self.to_q = nn.Linear(
             in_features=features, out_features=mid_features, bias=False
         )
@@ -173,14 +158,13 @@ class CrossAttention(nn.Module):
             features,
             num_heads=num_heads,
             head_features=head_features,
+            out_features=out_features,
             **kwargs,
         )
 
-    def forward(self, x: Tensor, context: Tensor, **kwargs) -> Tensor:
-        b, n, d = x.shape
-        x = self.norm_in(x)
-        context = self.norm_context(context)
-        # Queries form x, k and v from context
+    def forward(self, x: Tensor, context: Optional[Tensor] = None, **kwargs) -> Tensor:
+        context = default(context, x)
+        x, context = self.norm(x), self.norm_context(context)
         q, k, v = (self.to_q(x), *torch.chunk(self.to_kv(context), chunks=2, dim=-1))
         x = self.attention(q, k, v, **kwargs)
         return x
@@ -263,24 +247,25 @@ Transformers
 """
 
 
-class AutoregressiveTransformer(nn.Module):
+class Transformer(nn.Module):
     def __init__(
         self,
         features: int,
-        num_tokens: int,
         max_length: int,
-        num_layers: int = 12,
-        head_features: int = 64,
-        num_heads: int = 12,
-        multiplier: int = 4,
+        num_layers: int,
+        head_features: int,
+        num_heads: int,
+        multiplier: int,
         use_positional_embedding: bool = True,
+        causal: bool = False,
+        use_cross_attention: bool = False,
     ):
         super().__init__()
+        self.features = features
+        self.max_length = max_length
 
-        self.to_embedding = nn.Embedding(num_tokens, features)
-
-        self.transformer = nn.Sequential(
-            *[
+        self.blocks = nn.ModuleList(
+            [
                 TransformerBlock(
                     features=features,
                     head_features=head_features,
@@ -288,15 +273,30 @@ class AutoregressiveTransformer(nn.Module):
                     multiplier=multiplier,
                     max_length=max_length,
                     use_positional_embedding=use_positional_embedding,
-                    causal=True,
+                    causal=causal,
+                    context_features=features if use_cross_attention else None,
                 )
                 for i in range(num_layers)
             ]
         )
 
-        self.to_logits = nn.Linear(in_features=features, out_features=num_tokens)
+    def forward(self, embedding: Tensor, **kwargs) -> Tensor:
+        for block in self.blocks:
+            embedding = block(embedding, **kwargs)
+        return embedding
 
-    def forward(self, tokens: Tensor, **kwargs) -> Tensor:
+
+class Autoregressive(nn.Module):
+    def __init__(self, transformer: Transformer, num_tokens: int, **kwargs):
+        super().__init__()
+        self.features = transformer.features
+        self.max_length = transformer.max_length
+        self.transformer = transformer
+
+        self.to_embedding = nn.Embedding(num_tokens, self.features)
+        self.to_logits = nn.Linear(in_features=self.features, out_features=num_tokens)
+
+    def forward(self, tokens: Tensor, return_logits: bool = False, **kwargs) -> Tensor:
         # Pick input embedding and target sequence
         input_tokens = tokens[:, :-1]
         target_tokens = tokens[:, 1:]
@@ -305,6 +305,61 @@ class AutoregressiveTransformer(nn.Module):
         output_embedding = self.transformer(input_embedding, **kwargs)
         output_logits = self.to_logits(output_embedding)
         output_logits = rearrange(output_logits, "b n t -> b t n")
+        if return_logits:
+            return output_logits
         # Compute and return loss
         loss = F.cross_entropy(output_logits, target_tokens)
         return loss
+
+    def generate(
+        self,
+        start_tokens: Tensor,
+        sequence_length: int,
+        top_k_threshold: float = 0.9,
+        temperature: float = 1.0,
+        **kwargs,
+    ) -> Tensor:
+        t, s = start_tokens.shape[1], self.max_length
+        tokens = start_tokens
+
+        for _ in range(sequence_length):
+            # Compute last token logits
+            logits = self(tokens=tokens[:, -s:], return_logits=True, **kwargs)
+            logits = logits[:, -1]
+            # Gumbel sample from top-k logits
+            logits = top_k(logits, threshold=top_k_threshold)
+            sample = gumbel_sample(logits, dim=-1, temperature=temperature)
+            # Append sampled token
+            tokens = torch.cat([tokens, rearrange(sample, "b -> b 1")], dim=-1)
+
+        # Return only generated tokens
+        return tokens[:, t:]
+
+
+class Resampler(Transformer):
+    def __init__(self, features: int, out_tokens: int, **kwargs):
+        super().__init__(
+            features=features,
+            max_length=out_tokens,
+            causal=False,
+            use_cross_attention=True,
+            use_positional_embedding=True,
+            **kwargs,
+        )
+
+        self.embedding = nn.Parameter(torch.randn(out_tokens, features))
+
+    def forward(self, context: Tensor, **kwargs) -> Tensor:  # type: ignore
+        b = context.shape[0]
+        embedding = repeat(self.embedding, "n d -> b n d", b=b)
+        return super().forward(embedding, context=context, **kwargs)
+
+
+class Monolith(nn.Module):
+    def __init__(
+        self,
+    ):
+        super().__init__()
+
+    def forward(self, embedding: Tensor) -> Tensor:
+        pass
