@@ -3,7 +3,7 @@ from typing import Callable, Optional, TypeVar, Union
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 from einops_exts import rearrange_many
 from torch import Tensor, einsum, nn
 from typing_extensions import TypeGuard
@@ -49,22 +49,10 @@ Attention Components
 """
 
 
-def attention_mask(
-    sim: Tensor,
-    mask: Tensor,
-) -> Tensor:
-    mask = rearrange(mask, "b j -> b 1 1 j")
+def add_mask(sim: Tensor, mask: Tensor) -> Tensor:
+    mask = rearrange(mask, "b n m -> b 1 n m")
     max_neg_value = -torch.finfo(sim.dtype).max
     sim = sim.masked_fill(~mask, max_neg_value)
-    return sim
-
-
-def causal_mask(sim: Tensor) -> Tensor:
-    i, j, device = *sim.shape[-2:], sim.device
-    max_neg_value = -torch.finfo(sim.dtype).max
-    mask = torch.ones((i, j), dtype=torch.bool, device=device).triu(j - i + 1)
-    sim = sim.masked_fill(mask, max_neg_value)
-    del mask
     return sim
 
 
@@ -76,12 +64,10 @@ class AttentionBase(nn.Module):
         head_features: int,
         num_heads: int,
         out_features: Optional[int] = None,
-        causal: bool = False,
     ):
         super().__init__()
         self.scale = head_features**-0.5
         self.num_heads = num_heads
-        self.causal = causal
         mid_features = head_features * num_heads
         out_features = default(out_features, features)
 
@@ -90,21 +76,14 @@ class AttentionBase(nn.Module):
         )
 
     def forward(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        *,
-        causal: bool = False,
-        mask: Optional[Tensor] = None,
+        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
     ) -> Tensor:
         # Split heads
         q, k, v = rearrange_many((q, k, v), "b n (h d) -> b h n d", h=self.num_heads)
 
-        # Compute similarity matrix, add bias and mask
+        # Compute similarity matrix and add eventual mask
         sim = einsum("... n d, ... m d -> ... n m", q, k) * self.scale
-        sim = attention_mask(sim, mask) if exists(mask) else sim
-        sim = causal_mask(sim) if (causal or self.causal) else sim
+        sim = add_mask(sim, mask) if exists(mask) else sim
 
         # Get attention matrix with softmax
         attn = sim.softmax(dim=-1, dtype=torch.float32)
@@ -113,6 +92,24 @@ class AttentionBase(nn.Module):
         out = einsum("... n m, ... m d -> ... n d", attn, v)
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out)
+
+
+def sequential_mask(mask: Tensor) -> Tensor:
+    return rearrange(mask, "b j -> b 1 j")
+
+
+def causal_mask(q: Tensor, k: Tensor) -> Tensor:
+    b, i, j, device = q.shape[0], q.shape[-2], k.shape[-2], q.device
+    mask = ~torch.ones((i, j), dtype=torch.bool, device=device).triu(j - i + 1)
+    mask = repeat(mask, "n m -> b n m", b=b)
+    return mask
+
+
+def cross_mask(q_mask: Tensor, k_mask: Tensor):
+    q_mask = rearrange(q_mask, "b i -> b i 1")
+    k_mask = rearrange(k_mask, "b j -> b 1 j")
+    mask = q_mask * k_mask
+    return mask
 
 
 class Attention(nn.Module):
@@ -124,10 +121,11 @@ class Attention(nn.Module):
         num_heads: int,
         out_features: Optional[int] = None,
         context_features: Optional[int] = None,
-        **kwargs,
+        causal: bool = False,
     ):
         super().__init__()
         self.context_features = context_features
+        self.causal = causal
         mid_features = head_features * num_heads
         context_features = default(context_features, features)
 
@@ -144,17 +142,36 @@ class Attention(nn.Module):
             num_heads=num_heads,
             head_features=head_features,
             out_features=out_features,
-            **kwargs,
         )
 
-    def forward(self, x: Tensor, context: Optional[Tensor] = None, **kwargs) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        context: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,  # [b, n], false is masked
+        context_mask: Optional[Tensor] = None,  # [b, m], false is masked
+        attention_mask: Optional[Tensor] = None,  # [b, n, m], false is masked
+    ) -> Tensor:
         assert_message = "You must provide a context when using context_features"
         assert not self.context_features or exists(context), assert_message
+
+        # Use context if provided
         context = default(context, x)
+
+        # Normalize then compute q from input and k,v from context
         x, context = self.norm(x), self.norm_context(context)
         q, k, v = (self.to_q(x), *torch.chunk(self.to_kv(context), chunks=2, dim=-1))
-        x = self.attention(q, k, v, **kwargs)
-        return x
+
+        # Compute attention mask (only one is applied, use attention_mask for custom)
+        if exists(mask) and not exists(context_mask):
+            attention_mask = sequential_mask(mask)
+        if exists(mask) and exists(context_mask):
+            attention_mask = cross_mask(mask, context_mask)
+        if self.causal:
+            attention_mask = causal_mask(q, k)
+
+        # Compute and return attention
+        return self.attention(q, k, v, mask=attention_mask)
 
 
 def FeedForward(features: int, multiplier: int) -> nn.Module:
@@ -193,13 +210,19 @@ class TransformerBlock(nn.Module):
         head_features: int,
         num_heads: int,
         multiplier: int,
+        causal: bool = False,
         max_length: Optional[int] = None,
         use_positional_embedding: bool = False,
-        **kwargs,
+        use_attention: bool = True,
+        use_cross_attention: bool = False,
+        context_features: Optional[int] = None,
+        out_features: Optional[int] = None,
     ):
         super().__init__()
 
         self.use_positional_embedding = use_positional_embedding
+        self.use_cross_attention = use_cross_attention
+        self.use_attention = use_attention
 
         if use_positional_embedding:
             assert_message = "max_length required if use_positional_embedding=True"
@@ -210,21 +233,56 @@ class TransformerBlock(nn.Module):
                 features=features,
             )
 
-        self.attention = Attention(
-            features=features,
-            head_features=head_features,
-            num_heads=num_heads,
-            **kwargs,
-        )
+        if use_cross_attention:
+            assert_message = "context_features required if use_cross_attention=True"
+            assert exists(context_features), assert_message
+
+            self.cross_attention = Attention(
+                features=features,
+                head_features=head_features,
+                num_heads=num_heads,
+                context_features=context_features,
+            )
+
+        if use_attention:
+            self.attention = Attention(
+                features=features,
+                head_features=head_features,
+                num_heads=num_heads,
+                causal=causal,
+                out_features=out_features,
+            )
 
         self.feed_forward = FeedForward(features=features, multiplier=multiplier)
 
-    def forward(self, x: Tensor, **kwargs) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
+        cross_attention_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         if self.use_positional_embedding:
             x = self.positional_embedding(x) + x
-        x = self.attention(x, **kwargs) + x
-        x = self.feed_forward(x) + x
-        return x
+
+        if self.use_attention:
+            x = self.attention(x, mask=mask, attention_mask=attention_mask) + x
+
+        if self.use_cross_attention:
+            x = (
+                self.cross_attention(
+                    x,
+                    mask=mask,
+                    context=context,
+                    context_mask=context_mask,
+                    attention_mask=cross_attention_mask,
+                )
+                + x
+            )
+
+        return self.feed_forward(x) + x
 
 
 """
@@ -269,6 +327,46 @@ class Transformer(nn.Module):
         for block in self.blocks:
             embedding = block(embedding, **kwargs)
         return embedding
+
+
+class TransformerRotator(nn.Module):
+    def __init__(self, transformer: Transformer, *, num_rotations: int = 1):
+        super().__init__()
+        self.transformer = transformer
+        self.num_rotations = num_rotations
+        self.tokens = nn.Parameter(torch.randn(num_rotations, transformer.features))
+
+    def forward(self, embedding: Tensor, **kwargs) -> Tensor:
+        b = embedding.shape[0]
+        embedding_head = embedding[:, self.num_rotations :]
+        embedding_tail = repeat(self.tokens, "n d -> b n d", b=b)
+        embedding = torch.cat([embedding_head, embedding_tail], dim=-2)
+        embedding = self.transformer(embedding, **kwargs)
+        return embedding
+
+
+class Resampler(Transformer):
+    def __init__(self, features: int, in_tokens: int, out_tokens: int, **kwargs):
+        super().__init__(
+            features=features,
+            max_length=out_tokens,
+            causal=False,
+            use_cross_attention=True,
+            use_positional_embedding=True,
+            **kwargs,
+        )
+
+        self.embedding = nn.Parameter(torch.randn(out_tokens, features))
+        self.context_positional_embedding = AbsolutePositionalEmbedding(
+            max_length=in_tokens,
+            features=features,
+        )
+
+    def forward(self, context: Tensor, **kwargs) -> Tensor:  # type: ignore
+        b = context.shape[0]
+        context = self.context_positional_embedding(context) + context
+        embedding = repeat(self.embedding, "n d -> b n d", b=b)
+        return super().forward(embedding, context=context, **kwargs)
 
 
 class Autoregressive(nn.Module):
