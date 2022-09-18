@@ -50,7 +50,11 @@ Attention Components
 
 
 def add_mask(sim: Tensor, mask: Tensor) -> Tensor:
-    mask = rearrange(mask, "b n m -> b 1 n m")
+    b, ndim = sim.shape[0], mask.ndim
+    if ndim == 3:
+        mask = rearrange(mask, "b n m -> b 1 n m")
+    if ndim == 2:
+        mask = repeat(mask, "n m -> b 1 n m", b=b)
     max_neg_value = -torch.finfo(sim.dtype).max
     sim = sim.masked_fill(~mask, max_neg_value)
     return sim
@@ -234,9 +238,6 @@ class TransformerBlock(nn.Module):
             )
 
         if use_cross_attention:
-            assert_message = "context_features required if use_cross_attention=True"
-            assert exists(context_features), assert_message
-
             self.cross_attention = Attention(
                 features=features,
                 head_features=head_features,
@@ -299,9 +300,12 @@ class Transformer(nn.Module):
         head_features: int,
         num_heads: int,
         multiplier: int,
-        use_positional_embedding: bool = True,
         causal: bool = False,
+        use_positional_embedding: bool = True,
+        use_attention: bool = True,
         use_cross_attention: bool = False,
+        context_features: Optional[int] = None,
+        out_features: Optional[int] = None,
     ):
         super().__init__()
         self.features = features
@@ -314,10 +318,13 @@ class Transformer(nn.Module):
                     head_features=head_features,
                     num_heads=num_heads,
                     multiplier=multiplier,
+                    causal=causal,
                     max_length=max_length,
                     use_positional_embedding=use_positional_embedding,
-                    causal=causal,
-                    context_features=features if use_cross_attention else None,
+                    use_attention=use_attention,
+                    use_cross_attention=use_cross_attention,
+                    context_features=context_features,
+                    out_features=out_features,
                 )
                 for i in range(num_layers)
             ]
@@ -329,16 +336,16 @@ class Transformer(nn.Module):
         return embedding
 
 
-class TransformerRotator(nn.Module):
-    def __init__(self, transformer: Transformer, *, num_rotations: int = 1):
+class TransformerShifter(nn.Module):
+    def __init__(self, transformer: Transformer, *, num_shift: int = 1):
         super().__init__()
         self.transformer = transformer
-        self.num_rotations = num_rotations
-        self.tokens = nn.Parameter(torch.randn(num_rotations, transformer.features))
+        self.num_shift = num_shift
+        self.tokens = nn.Parameter(torch.randn(num_shift, transformer.features))
 
     def forward(self, embedding: Tensor, **kwargs) -> Tensor:
         b = embedding.shape[0]
-        embedding_head = embedding[:, self.num_rotations :]
+        embedding_head = embedding[:, self.num_shift :]
         embedding_tail = repeat(self.tokens, "n d -> b n d", b=b)
         embedding = torch.cat([embedding_head, embedding_tail], dim=-2)
         embedding = self.transformer(embedding, **kwargs)
