@@ -407,6 +407,7 @@ class Autoregressive(nn.Module):
         sequence_length: int,
         top_k_threshold: float = 0.9,
         temperature: float = 1.0,
+        keep_start: bool = False,
         **kwargs,
     ) -> Tensor:
         t, s = start_tokens.shape[1], self.max_length
@@ -422,8 +423,7 @@ class Autoregressive(nn.Module):
             # Append sampled token
             tokens = torch.cat([tokens, rearrange(sample, "b -> b 1")], dim=-1)
 
-        # Return only generated tokens
-        return tokens[:, t:]
+        return tokens if keep_start else tokens[:, t:]
 
 
 class ContinuousAutoregressive(nn.Module):
@@ -439,7 +439,11 @@ class ContinuousAutoregressive(nn.Module):
         return F.mse_loss(target_embedding, output_embedding)
 
     def generate(
-        self, start_embedding: Tensor, sequence_length: int, **kwargs
+        self,
+        start_embedding: Tensor,
+        sequence_length: int,
+        keep_start: bool = False,
+        **kwargs,
     ) -> Tensor:
         t, s = start_embedding.shape[1], self.max_length
         embedding = start_embedding
@@ -451,5 +455,4 @@ class ContinuousAutoregressive(nn.Module):
             )
             embedding = torch.cat([embedding, output_embedding_last], dim=-2)
 
-        # Return only generated embeddings
-        return embedding[:, t:]
+        return embedding if keep_start else embedding[:, t:, :]
