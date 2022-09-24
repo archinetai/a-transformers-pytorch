@@ -339,9 +339,11 @@ class Transformer(nn.Module):
 class TransformerShifter(nn.Module):
     def __init__(self, transformer: Transformer, *, num_shift: int = 1):
         super().__init__()
+        self.features = transformer.features
+        self.max_length = transformer.max_length
         self.transformer = transformer
         self.num_shift = num_shift
-        self.tokens = nn.Parameter(torch.randn(num_shift, transformer.features))
+        self.tokens = nn.Parameter(torch.randn(num_shift, self.features))
 
     def forward(self, embedding: Tensor, **kwargs) -> Tensor:
         b = embedding.shape[0]

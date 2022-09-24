@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 setup(
     name="a-transformers-pytorch",
     packages=find_packages(exclude=[]),
-    version="0.0.5",
+    version="0.0.6",
     license="MIT",
     description="A-Transformers - PyTorch",
     long_description_content_type="text/markdown",
