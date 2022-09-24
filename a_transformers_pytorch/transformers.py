@@ -391,13 +391,13 @@ class Autoregressive(nn.Module):
         # Compute output embedding and logits
         output_embedding = self.transformer(input_embedding, **kwargs)
         output_logits = self.to_logits(output_embedding)
-        output_logits = rearrange(output_logits, "b n t -> b t n")
         return output_logits
 
     def forward(self, tokens: Tensor, **kwargs) -> Tensor:
         input_tokens = tokens[:, :-1]
         target_tokens = tokens[:, 1:]
         logits = self.compute_logits(input_tokens)
+        logits = rearrange(logits, "b n t -> b t n")
         loss = F.cross_entropy(logits, target_tokens)
         return loss
 
@@ -424,3 +424,32 @@ class Autoregressive(nn.Module):
 
         # Return only generated tokens
         return tokens[:, t:]
+
+
+class ContinuousAutoregressive(nn.Module):
+    def __init__(self, transformer: Transformer, **kwargs):
+        super().__init__()
+        self.transformer = transformer
+        self.max_length = transformer.max_length
+
+    def forward(self, embedding: Tensor, **kwargs) -> Tensor:
+        input_embedding = embedding[:, :-1, :]
+        target_embedding = embedding[:, 1:, :]
+        output_embedding = self.transformer(input_embedding, **kwargs)
+        return F.mse_loss(target_embedding, output_embedding)
+
+    def generate(
+        self, start_embedding: Tensor, sequence_length: int, **kwargs
+    ) -> Tensor:
+        t, s = start_embedding.shape[1], self.max_length
+        embedding = start_embedding
+
+        for _ in range(sequence_length):
+            output_embedding = self.transformer(embedding[:, -s:, :], **kwargs)
+            output_embedding_last = rearrange(
+                output_embedding[:, -1, :], "b d -> b 1 d"
+            )
+            embedding = torch.cat([embedding, output_embedding_last], dim=-2)
+
+        # Return only generated embeddings
+        return embedding[:, t:]
