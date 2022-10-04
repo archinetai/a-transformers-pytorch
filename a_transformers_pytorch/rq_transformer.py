@@ -119,32 +119,26 @@ class RQTransformer(nn.Module):
             embedding_time = self.transformer_time(embedding_time)
             embedding_residual = rearrange(embedding_time[:, -1], "b d -> b 1 d")
 
-            for _ in range(r):
-                # Compute residual autoregressively
+            # Compute residual autoregressively
+            residual_tokens_list = []
+            for i in range(r):
+                # Get last output embedding
                 embedding_last = self.transformer_residual(embedding_residual)[:, -1]
-                embedding_last = rearrange(embedding_last, "b d -> b 1 d")
+                # Sample residual token from last logits
+                logits_last = self.to_logits[i](embedding_last)
+                logits_last = top_k(logits_last, threshold=top_k_threshold)
+                sample = gumbel_sample(logits_last, dim=-1, temperature=temperature)
+                residual_tokens_list += [sample]
+                # Compute next embedding and append to end
+                embedding_next = self.to_embedding[i](sample)
+                embedding_next = rearrange(embedding_next, "b d -> b 1 d")
                 embedding_residual = torch.cat(
-                    [embedding_residual, embedding_last], dim=1
+                    [embedding_residual, embedding_next], dim=1
                 )
 
-            embedding_output = rearrange(embedding_residual[:, 1:], "b r d -> r b d")
-            logits_list = [self.to_logits[i](embedding_output[i]) for i in range(r)]
-            logits = torch.stack(logits_list)
-            logits = rearrange(logits, "r b t -> (r b) t")
-
-            # Gumbel sample from top-k logits
-            logits = top_k(logits, threshold=top_k_threshold)
-            sample = gumbel_sample(logits, dim=-1, temperature=temperature)
-            sample = rearrange(sample, "(r b) -> b 1 r", r=r)
-
-            # Append new sample tokens
-            tokens = torch.cat([tokens, sample], dim=1)
-
-            # # Compute sampled token embedding
-            # embeddings_list = [self.to_embedding[i](sample[:,:,i]) for i in range(r)]
-            # embeddings = torch.stack(embeddings_list)
-            # embedding_time_sample = reduce(embeddings, 'r b 1 d -> b 1 d', 'sum')
-            # embedding_time = torch.cat([embedding_time, embedding_time_sample], dim=1)
-            # embedding_time = embedding_time[:,-s:]
+            # Merge tokens with current timestep residual tokens
+            residual_tokens = torch.stack(residual_tokens_list)
+            residual_tokens = rearrange(residual_tokens, "r b -> b 1 r")
+            tokens = torch.cat([tokens, residual_tokens], dim=1)
 
         return tokens if keep_start else tokens[:, sequence_length:]
