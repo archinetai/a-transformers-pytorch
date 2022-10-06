@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange, reduce
@@ -21,10 +23,12 @@ class RQTransformer(nn.Module):
         num_heads: int,
         multiplier: int,
         shared_codebook: bool,
+        use_cross_attention: bool = False,
     ):
         super().__init__()
         self.max_length = max_length
         self.max_residuals = max_residuals
+        self.use_cross_attention = use_cross_attention
 
         self.to_embedding = nn.ModuleList(
             [
@@ -41,6 +45,7 @@ class RQTransformer(nn.Module):
             num_heads=num_heads,
             multiplier=multiplier,
             causal=True,
+            use_cross_attention=use_cross_attention,
         )
 
         self.transformer_residual = Transformer(
@@ -65,7 +70,7 @@ class RQTransformer(nn.Module):
                 self.to_embedding[i] = self.to_embedding[0]
                 self.to_logits[i] = self.to_logits[0]
 
-    def forward(self, tokens: Tensor) -> Tensor:
+    def forward(self, tokens: Tensor, context: Optional[Tensor] = None) -> Tensor:
         b, _, r = tokens.shape
 
         # Compute embedding for each residual series
@@ -74,7 +79,7 @@ class RQTransformer(nn.Module):
 
         # Compute time embedding autoregressively (hide last and predict it)
         embedding_time = reduce(embeddings, "r b n d -> b n d", "sum")[:, :-1]
-        embedding_time = self.transformer_time(embedding_time)
+        embedding_time = self.transformer_time(embedding_time, context=context)
         embedding_time = rearrange(embedding_time, "b n d -> 1 b n d")
 
         # Compute output embedding by autoregressively predicting residual embeddings
@@ -98,6 +103,7 @@ class RQTransformer(nn.Module):
         self,
         start_tokens: Tensor,
         sequence_length: int,
+        context: Optional[Tensor] = None,
         top_k_threshold: float = 0.9,
         temperature: float = 1.0,
         keep_start: bool = False,
@@ -116,7 +122,7 @@ class RQTransformer(nn.Module):
             embedding_time = reduce(embeddings, "r b n d -> b n d", "sum")
 
             # Compute next time embedding
-            embedding_time = self.transformer_time(embedding_time)
+            embedding_time = self.transformer_time(embedding_time, context=context)
             embedding_residual = rearrange(embedding_time[:, -1], "b d -> b 1 d")
 
             # Compute residual autoregressively
