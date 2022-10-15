@@ -355,7 +355,14 @@ class TransformerShifter(nn.Module):
 
 
 class Resampler(Transformer):
-    def __init__(self, features: int, in_tokens: int, out_tokens: int, **kwargs):
+    def __init__(
+        self,
+        features: int,
+        in_tokens: int,
+        out_tokens: int,
+        use_random: bool = False,
+        **kwargs,
+    ):
         super().__init__(
             features=features,
             max_length=out_tokens,
@@ -364,17 +371,25 @@ class Resampler(Transformer):
             use_positional_embedding=True,
             **kwargs,
         )
-
         self.embedding = nn.Parameter(torch.randn(out_tokens, features))
         self.context_positional_embedding = AbsolutePositionalEmbedding(
             max_length=in_tokens,
             features=features,
         )
+        self.use_random = use_random
 
-    def forward(self, context: Tensor, **kwargs) -> Tensor:  # type: ignore
-        b = context.shape[0]
-        context = self.context_positional_embedding(context) + context
-        embedding = repeat(self.embedding, "n d -> b n d", b=b)
+    def forward(  # type: ignore
+        self, context: Tensor, use_random: Optional[bool] = None, **kwargs
+    ) -> Tensor:
+        b, n, device = context.shape[0], self.embedding.shape[0], context.device
+        use_random = default(use_random, self.use_random)
+        context = context + self.context_positional_embedding(context)
+        if use_random:
+            assert self.use_random, "use_random requires use_random=True at init"
+            indices = torch.randint(0, n, size=(b * n,), device=device)
+            embedding = rearrange(self.embedding[indices], "(b n) d -> b n d", b=b)
+        else:
+            embedding = repeat(self.embedding, "n d -> b n d", b=b)
         return super().forward(embedding, context=context, **kwargs)
 
 
